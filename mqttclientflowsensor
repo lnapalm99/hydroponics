@@ -1,0 +1,283 @@
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <NewPing.h>
+float calibrationFactor = 4;
+const byte InterruptPin = 5;
+volatile byte pulseCount;  
+
+float flowRate;
+unsigned int flowMilliLitres;
+unsigned long totalMilliLitres;
+
+unsigned long oldTime;
+void ICACHE_RAM_ATTR pulseCounter();
+#define Trigger_PIN 13 // pin d7 esp8266
+#define Echo_PIN 12 // pin d6 esp8266
+#define MAX_Distance 200
+NewPing sonar(Trigger_PIN, Echo_PIN, MAX_Distance);
+
+// Credenciales de Red Wi Fi
+const char* ssid = "TP-Link_0580";
+const char* password = "07078972";
+
+//  Raspberry Pi Direccion IP  para conectar al MQTT broker
+const char* mqtt_server = "192.168.137.110";
+
+// Inicio de espClient.
+WiFiClient espClient2;
+PubSubClient client(espClient2);
+
+// Lamp - LED - GPIO 4 = D2 on ESP-12E NodeMCU board
+const int valvula = 4;
+//Luces GPIO 0 = D3
+const int luces = 0;
+// Builtin LED
+
+// Variables de Tiempo Auxiliares
+long now = millis();
+long lastMeasure = 0;
+// Esta funcion conecta al ESP8266 con el Router
+void setup_wifi() {
+  delay(10);
+  // Conectando a Red Wi Fi
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("WiFi connected - ESP IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+
+// Esta funcion es ejecutada cuando un dispositivo publica un mensaje en un topic que el ESP8266 esta suscripto
+void callback(String topic, byte* message, unsigned int length) {
+  Serial.print("Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+  String messageTemp;
+  
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)message[i]);
+    messageTemp += (char)message[i];
+  }
+  Serial.println();
+
+  // Se controlan los GPIO en funcion a los mensajes MQTT que llegan en el topico correspondiente
+if(topic=="esp2/builtin"){
+      Serial.print("Cambiando estado de LED del cliente 2: ");
+      if(messageTemp == "on"){
+        digitalWrite(LED_BUILTIN, HIGH);
+        Serial.print("Encendido LED Cliente 2");
+      }
+      else if(messageTemp == "off"){
+        digitalWrite(LED_BUILTIN, LOW);
+        Serial.print("Apagado LED Cliente 2");
+      }
+}
+  if(topic=="riego/valvula"){
+      Serial.print("Cambiando estado de valvula a: ");
+      if(messageTemp == "on"){
+        digitalWrite(valvula, HIGH);
+        Serial.print("Cerrada");
+      }
+      else if(messageTemp == "off"){
+        digitalWrite(valvula, LOW);
+        Serial.print("Abierta");
+      }
+  }
+  if(topic=="control/iluminacion"){
+      Serial.print("Cambiando estado de luces a: ");
+      if(messageTemp == "on"){
+        digitalWrite(luces, HIGH);
+        Serial.print("Encendidas");
+      }
+      else if(messageTemp == "off"){
+        digitalWrite(luces, LOW);
+        Serial.print("Apagadas");
+      }
+  }
+  Serial.println();
+}
+
+// Esta funcion reconecta al ESP8266 con el Broker
+// En esta funcion se suscribe a los topicos correspondientes
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    /*
+     YOU MIGHT NEED TO CHANGE THIS LINE, IF YOU'RE HAVING PROBLEMS WITH MQTT MULTIPLE CONNECTIONS
+     To change the ESP device ID, you will have to give a new name to the ESP8266.
+     Here's how it looks:
+       if (client.connect("ESP8266Client")) {
+     You can do it like this:
+       if (client.connect("ESP1_Office")) {
+     Then, for the other ESP:
+       if (client.connect("ESP2_Garage")) {
+      That should solve your MQTT multiple connections problem
+    */
+    if (client.connect("espClient2")) {
+      Serial.println("connected");  
+      // Subscribe a un topic
+      
+      client.subscribe("riego/valvula");
+      client.subscribe("control/iluminacion");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Espera 5 segundos antes de reintentar la conexion
+      delay(5000);
+    }
+  }
+}
+
+void setup() {
+   pinMode(LED_BUILTIN, OUTPUT);
+   pinMode(InterruptPin, INPUT_PULLUP);
+  digitalWrite(InterruptPin, HIGH);
+
+  pulseCount        = 0;
+  flowRate          = 0.0;
+  flowMilliLitres   = 0;
+  totalMilliLitres  = 0;
+  oldTime           = 0;
+
+  // The Hall-effect sensor esta conectado al 5 which uses interrupt 0V.
+  // Se configura el disparo de interrupcion como FALLING 
+
+  //Arduino Interrupt
+  //attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
+
+  //Esp8266 Dig to Interrupt
+  attachInterrupt(digitalPinToInterrupt(InterruptPin), pulseCounter, FALLING);
+
+
+  pinMode(valvula, OUTPUT);
+  pinMode(luces, OUTPUT);
+  
+  
+  Serial.begin(115200);
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+
+}
+
+// For this project, you don't need to change anything in the loop function. Basically it ensures that you ESP is connected to your broker
+void loop() {
+
+  if (!client.connected()) {
+    reconnect();
+  }
+  if(!client.loop())
+    client.connect("espClient2");
+
+
+//Flowmeter sketch
+
+if((millis() - oldTime) > 1000)    // Se procesan las interrupciones cada segundo
+  { 
+    // Se desabilita la interrupcion mientras se calcula el valor del caudal
+    // the host
+    //detach Arduino (uncomment)
+    
+    //detachInterrupt(sensorInterrupt);
+
+    //detach ESP8266
+
+    detachInterrupt(digitalPinToInterrupt(InterruptPin));
+    
+    // Se utiliza este loop para corregir el error ya que la medicion no ocurre exactamente en 1 segundo
+    flowRate = ((1000.0 / (millis() - oldTime)) * pulseCount) / calibrationFactor;
+    
+    
+    oldTime = millis();
+    // Se divide el flujo en litros por minuto por 60 para determinar cuantos litros pasan por segundo, 
+    //luego se multiplica por 1000 para hallar los mililitros
+   
+    flowMilliLitres = (flowRate / 60) * 1000;
+    
+    // se agregan los mililitros hallados al total
+    totalMilliLitres += flowMilliLitres;
+      
+    unsigned int frac;
+    
+    
+    // Se resetea el contador para contar las interrupciones de nuevo
+    pulseCount = 0;
+    
+    // Se activa las interrupciones
+
+    //ARduino Commented
+    //attachInterrupt(sensorInterrupt, pulseCounter, FALLING);
+
+    //Esp8266 attach
+    attachInterrupt(digitalPinToInterrupt(InterruptPin), pulseCounter, FALLING);
+  }
+  now = millis();
+  // Se publican los valores de distancia, caudal y volumen actual
+  if (now - lastMeasure > 30000) {
+    lastMeasure = now;
+    // Sensor readings may also be up to 2 seconds 'old' (its a very slow sensor)
+    float l = sonar.ping_cm();
+    // Read temperature as Celsius (the default)
+    float  v = 0;
+    // Read temperature as Fahrenheit (isFahrenheit = true)
+    float f = int(flowRate);
+
+   
+//distancia a % de tanque
+if (l >= 36 && l <= 40)
+{ v = 10;
+}
+if (l >= 32 && l < 36)
+{ v = 30;
+}
+if (l >= 28 && l < 32)
+{ v = 50;
+}
+if (l >= 24 && l < 28)
+{ v = 70;
+}
+if (l >= 20 && l < 24)
+{ v = 90;
+}
+
+
+  
+     static char caudalTemp[7];
+     dtostrf(f, 6, 2, caudalTemp);
+    
+    static char volumenTemp[7];
+    dtostrf(v, 6, 2, volumenTemp);
+
+    static char distanciaTemp[7];
+    dtostrf(l, 6, 2, distanciaTemp);
+
+    // Se publican los valores hallados en los topicos correspondientes
+    client.publish("riego/volumen", volumenTemp);
+    client.publish("riego/caudal", caudalTemp);
+     client.publish("riego/distancia", distanciaTemp);
+     
+    Serial.print("distancia: ");
+    Serial.print(l);
+    Serial.print("cm Tanque de riego   ");
+    Serial.print(v);
+    Serial.print("%  Caudal: ");
+    Serial.print(f);
+    Serial.println(" Lts/min ");
+   
+  }
+}
+  void ICACHE_RAM_ATTR pulseCounter()
+{
+  // Incremento del contador de pulsos
+  pulseCount++;
+}
